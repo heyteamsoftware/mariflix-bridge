@@ -1,5 +1,11 @@
 import express from 'express';
 import WebTorrent from 'webtorrent';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const TORRENTS_DIR = path.join(__dirname, 'torrents');
 
 const app = express();
 const client = new WebTorrent();
@@ -18,8 +24,8 @@ app.use((req, res, next) => {
   next();
 });
 
-const activeTorrents = new Map(); // torrentUrl -> torrent
-const pendingAdds = new Map(); // torrentUrl -> Promise
+const activeTorrents = new Map(); // relPath -> torrent
+const pendingAdds = new Map(); // relPath -> Promise
 
 const MIME_BY_EXT = {
   mp4: 'video/mp4',
@@ -34,25 +40,81 @@ function mimeForFile(name) {
   return MIME_BY_EXT[ext] || 'application/octet-stream';
 }
 
-function isAllowedTorrentUrl(url) {
-  try {
-    const u = new URL(url);
-    return u.protocol === 'https:' && u.pathname.endsWith('.torrent');
-  } catch {
-    return false;
-  }
+// --- Catálogo (lee la carpeta torrents/ local) ---
+
+function listTorrentFiles(dir) {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter(f => f.toLowerCase().endsWith('.torrent'))
+    .map(f => ({ name: path.parse(f).name, file: f }))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
 }
 
-async function addTorrent(torrentUrl) {
-  const res = await fetch(torrentUrl, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
-  });
-  if (!res.ok) throw new Error('No se pudo descargar el .torrent: HTTP ' + res.status);
-  const buf = Buffer.from(await res.arrayBuffer());
+function hasTorrentFiles(dir) {
+  return fs.existsSync(dir) && fs.readdirSync(dir).some(f => f.toLowerCase().endsWith('.torrent'));
+}
 
-  if (buf.length < 20 || buf[0] !== 0x64 /* 'd' bencode dict */) {
-    throw new Error('El archivo descargado no parece un .torrent válido (¿bloqueado por el hosting?)');
+function buildCatalog() {
+  const catalog = { movies: [], series: [] };
+  if (!fs.existsSync(TORRENTS_DIR)) return catalog;
+
+  for (const entry of fs.readdirSync(TORRENTS_DIR)) {
+    const full = path.join(TORRENTS_DIR, entry);
+    const stat = fs.statSync(full);
+
+    if (stat.isDirectory()) {
+      const series = { name: entry, seasons: [] };
+
+      if (hasTorrentFiles(full)) {
+        series.seasons.push({
+          name: 'Temporada 1',
+          path: entry,
+          episodes: listTorrentFiles(full),
+        });
+      }
+
+      for (const sub of fs.readdirSync(full)) {
+        const subFull = path.join(full, sub);
+        if (fs.statSync(subFull).isDirectory()) {
+          series.seasons.push({
+            name: sub,
+            path: entry + '/' + sub,
+            episodes: listTorrentFiles(subFull),
+          });
+        }
+      }
+
+      if (series.seasons.length) catalog.series.push(series);
+    } else if (entry.toLowerCase().endsWith('.torrent')) {
+      catalog.movies.push({ name: path.parse(entry).name, file: entry });
+    }
   }
+
+  catalog.movies.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  catalog.series.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  return catalog;
+}
+
+app.get('/catalog', (req, res) => {
+  res.json(buildCatalog());
+});
+
+// --- Streaming ---
+
+function safeRelPath(relPath) {
+  const normalized = path.normalize(relPath).replace(/^([./\\])+/, '');
+  const full = path.join(TORRENTS_DIR, normalized);
+  if (!full.startsWith(TORRENTS_DIR)) return null;
+  if (!full.toLowerCase().endsWith('.torrent')) return null;
+  return { normalized, full };
+}
+
+async function addTorrentFromDisk(relPath) {
+  const resolved = safeRelPath(relPath);
+  if (!resolved) throw new Error('Ruta de torrent inválida');
+  if (!fs.existsSync(resolved.full)) throw new Error('Archivo .torrent no encontrado: ' + relPath);
+
+  const buf = fs.readFileSync(resolved.full);
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -70,36 +132,32 @@ async function addTorrent(torrentUrl) {
   });
 }
 
-async function getOrAddTorrent(torrentUrl) {
-  if (activeTorrents.has(torrentUrl)) {
-    return activeTorrents.get(torrentUrl);
-  }
-  if (pendingAdds.has(torrentUrl)) {
-    return pendingAdds.get(torrentUrl);
-  }
+async function getOrAddTorrent(relPath) {
+  if (activeTorrents.has(relPath)) return activeTorrents.get(relPath);
+  if (pendingAdds.has(relPath)) return pendingAdds.get(relPath);
 
-  const promise = addTorrent(torrentUrl)
+  const promise = addTorrentFromDisk(relPath)
     .then((torrent) => {
-      activeTorrents.set(torrentUrl, torrent);
-      torrent.on('close', () => activeTorrents.delete(torrentUrl));
+      activeTorrents.set(relPath, torrent);
+      torrent.on('close', () => activeTorrents.delete(relPath));
       return torrent;
     })
-    .finally(() => pendingAdds.delete(torrentUrl));
+    .finally(() => pendingAdds.delete(relPath));
 
-  pendingAdds.set(torrentUrl, promise);
+  pendingAdds.set(relPath, promise);
   return promise;
 }
 
 app.get('/health', (req, res) => res.json({ ok: true, torrents: activeTorrents.size }));
 
 app.get('/stream', async (req, res) => {
-  const torrentUrl = req.query.torrent;
-  if (!torrentUrl || !isAllowedTorrentUrl(torrentUrl)) {
-    return res.status(400).send('Parámetro "torrent" inválido o ausente (debe ser una URL https a un .torrent)');
+  const relPath = req.query.path;
+  if (!relPath) {
+    return res.status(400).send('Parámetro "path" ausente (ruta relativa al .torrent dentro de /torrents)');
   }
 
   try {
-    const torrent = await getOrAddTorrent(torrentUrl);
+    const torrent = await getOrAddTorrent(relPath);
 
     const file = torrent.files
       .filter(f => /\.(mp4|mkv|webm|avi|mov)$/i.test(f.name))
