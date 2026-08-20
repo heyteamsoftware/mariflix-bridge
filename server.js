@@ -15,6 +15,19 @@ app.use((req, res, next) => {
 
 const activeTorrents = new Map(); // torrentUrl -> torrent
 
+const MIME_BY_EXT = {
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mkv: 'video/x-matroska',
+  avi: 'video/x-msvideo',
+  mov: 'video/quicktime',
+};
+
+function mimeForFile(name) {
+  const ext = name.split('.').pop().toLowerCase();
+  return MIME_BY_EXT[ext] || 'application/octet-stream';
+}
+
 function isAllowedTorrentUrl(url) {
   try {
     const u = new URL(url);
@@ -67,7 +80,7 @@ app.get('/stream', async (req, res) => {
     const range = req.headers.range;
     const fileSize = file.length;
 
-    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Type', mimeForFile(file.name));
     res.setHeader('Accept-Ranges', 'bytes');
 
     if (!range) {
