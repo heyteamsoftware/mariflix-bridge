@@ -5,6 +5,11 @@ const app = express();
 const client = new WebTorrent();
 const PORT = process.env.PORT || 3000;
 
+// Sin esto, cualquier fallo al parsear un torrent tira abajo todo el proceso Node.
+client.on('error', (err) => {
+  console.error('WebTorrent client error:', err && err.message);
+});
+
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
 app.use((req, res, next) => {
@@ -14,6 +19,7 @@ app.use((req, res, next) => {
 });
 
 const activeTorrents = new Map(); // torrentUrl -> torrent
+const pendingAdds = new Map(); // torrentUrl -> Promise
 
 const MIME_BY_EXT = {
   mp4: 'video/mp4',
@@ -37,25 +43,51 @@ function isAllowedTorrentUrl(url) {
   }
 }
 
+async function addTorrent(torrentUrl) {
+  const res = await fetch(torrentUrl, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
+  });
+  if (!res.ok) throw new Error('No se pudo descargar el .torrent: HTTP ' + res.status);
+  const buf = Buffer.from(await res.arrayBuffer());
+
+  if (buf.length < 20 || buf[0] !== 0x64 /* 'd' bencode dict */) {
+    throw new Error('El archivo descargado no parece un .torrent válido (¿bloqueado por el hosting?)');
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) { settled = true; reject(new Error('Timeout esperando metadata del torrent')); }
+    }, 30000);
+
+    try {
+      client.add(buf, { destroyStoreOnDestroy: true }, (t) => {
+        if (!settled) { settled = true; clearTimeout(timer); resolve(t); }
+      });
+    } catch (err) {
+      if (!settled) { settled = true; clearTimeout(timer); reject(err); }
+    }
+  });
+}
+
 async function getOrAddTorrent(torrentUrl) {
   if (activeTorrents.has(torrentUrl)) {
     return activeTorrents.get(torrentUrl);
   }
+  if (pendingAdds.has(torrentUrl)) {
+    return pendingAdds.get(torrentUrl);
+  }
 
-  const res = await fetch(torrentUrl);
-  if (!res.ok) throw new Error('No se pudo descargar el .torrent: HTTP ' + res.status);
-  const buf = Buffer.from(await res.arrayBuffer());
+  const promise = addTorrent(torrentUrl)
+    .then((torrent) => {
+      activeTorrents.set(torrentUrl, torrent);
+      torrent.on('close', () => activeTorrents.delete(torrentUrl));
+      return torrent;
+    })
+    .finally(() => pendingAdds.delete(torrentUrl));
 
-  const torrent = await new Promise((resolve, reject) => {
-    client.add(buf, { destroyStoreOnDestroy: true }, (t) => resolve(t));
-    setTimeout(() => reject(new Error('Timeout esperando metadata del torrent')), 30000);
-  });
-
-  activeTorrents.set(torrentUrl, torrent);
-
-  torrent.on('close', () => activeTorrents.delete(torrentUrl));
-
-  return torrent;
+  pendingAdds.set(torrentUrl, promise);
+  return promise;
 }
 
 app.get('/health', (req, res) => res.json({ ok: true, torrents: activeTorrents.size }));
