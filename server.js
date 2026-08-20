@@ -7,6 +7,8 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TORRENTS_DIR = path.join(__dirname, 'torrents');
 
+fs.mkdirSync('/tmp/mariflix-downloads', { recursive: true });
+
 const app = express();
 const client = new WebTorrent();
 const PORT = process.env.PORT || 3000;
@@ -123,7 +125,7 @@ async function addTorrentFromDisk(relPath) {
     }, 30000);
 
     try {
-      client.add(buf, { destroyStoreOnDestroy: true }, (t) => {
+      client.add(buf, { path: '/tmp/mariflix-downloads' }, (t) => {
         if (!settled) { settled = true; clearTimeout(timer); resolve(t); }
       });
     } catch (err) {
