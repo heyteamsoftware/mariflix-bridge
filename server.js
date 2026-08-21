@@ -3,8 +3,6 @@ import WebTorrent from 'webtorrent';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { spawn } from 'child_process';
-import ffmpegPath from 'ffmpeg-static';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TORRENTS_DIR = path.join(__dirname, 'torrents');
@@ -154,7 +152,57 @@ async function getOrAddTorrent(relPath) {
 
 app.get('/health', (req, res) => res.json({ ok: true, torrents: activeTorrents.size }));
 
-app.get('/stream', async (req, res) => {
+function pickVideoFile(torrent) {
+  return torrent.files
+    .filter(f => /\.(mp4|mkv|webm|avi|mov)$/i.test(f.name))
+    .sort((a, b) => b.length - a.length)[0];
+}
+
+function countSeedsAndLeechers(torrent) {
+  let seeds = 0;
+  let leechers = 0;
+  const totalPieces = torrent.pieces ? torrent.pieces.length : 0;
+
+  for (const wire of torrent.wires) {
+    let hasAll = totalPieces > 0;
+    if (totalPieces > 0) {
+      for (let i = 0; i < totalPieces; i++) {
+        if (!wire.peerPieces.get(i)) { hasAll = false; break; }
+      }
+    } else {
+      hasAll = false;
+    }
+    if (hasAll) seeds++;
+    else leechers++;
+  }
+
+  return { seeds, leechers };
+}
+
+app.get('/progress', async (req, res) => {
+  const relPath = req.query.path;
+  if (!relPath) return res.status(400).json({ error: 'Falta "path"' });
+
+  try {
+    const torrent = await getOrAddTorrent(relPath);
+    const { seeds, leechers } = countSeedsAndLeechers(torrent);
+
+    res.json({
+      progress: torrent.progress,
+      downloadSpeed: torrent.downloadSpeed,
+      numPeers: torrent.numPeers,
+      seeds,
+      leechers,
+      length: torrent.length,
+      downloaded: torrent.downloaded,
+      done: torrent.done,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/download', async (req, res) => {
   const relPath = req.query.path;
   if (!relPath) {
     return res.status(400).send('Parámetro "path" ausente (ruta relativa al .torrent dentro de /torrents)');
@@ -162,47 +210,19 @@ app.get('/stream', async (req, res) => {
 
   try {
     const torrent = await getOrAddTorrent(relPath);
-
-    const file = torrent.files
-      .filter(f => /\.(mp4|mkv|webm|avi|mov)$/i.test(f.name))
-      .sort((a, b) => b.length - a.length)[0];
+    const file = pickVideoFile(torrent);
 
     if (!file) {
       return res.status(404).send('No se encontró un archivo de vídeo en este torrent');
     }
 
-    // Remuxeamos a fragmented MP4 y recodificamos el audio a AAC (el vídeo se copia tal
-    // cual, sin recodificar, para no gastar CPU). Esto arregla el audio mudo cuando el
-    // archivo original trae AC3/DTS, que los navegadores no saben decodificar.
-    // Como el tamaño de salida no se conoce de antemano, no soportamos Range aquí:
-    // no hay salto preciso en la barra de progreso, pero sí hay audio.
-    res.setHeader('Content-Type', 'video/mp4');
-
-    const ffmpeg = spawn(ffmpegPath, [
-      '-i', 'pipe:0',
-      '-c:v', 'copy',
-      '-c:a', 'aac',
-      '-b:a', '192k',
-      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-      '-f', 'mp4',
-      'pipe:1',
-    ]);
-
-    ffmpeg.stderr.on('data', () => {}); // silenciar logs de ffmpeg, no son errores necesariamente
+    res.setHeader('Content-Type', mimeForFile(file.name));
+    res.setHeader('Content-Length', file.length);
+    res.setHeader('Content-Disposition', `attachment; filename="${file.name.replace(/"/g, '')}"`);
 
     const source = file.createReadStream();
-    source.pipe(ffmpeg.stdin);
-    ffmpeg.stdout.pipe(res);
-
-    const cleanup = () => {
-      source.destroy();
-      ffmpeg.kill('SIGKILL');
-    };
-    req.on('close', cleanup);
-    ffmpeg.on('error', (err) => {
-      console.error('ffmpeg error:', err.message);
-      cleanup();
-    });
+    source.pipe(res);
+    req.on('close', () => source.destroy());
   } catch (err) {
     console.error(err);
     res.status(500).send('Error: ' + err.message);
