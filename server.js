@@ -3,6 +3,8 @@ import WebTorrent from 'webtorrent';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { spawn } from 'child_process';
+import ffmpegPath from 'ffmpeg-static';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TORRENTS_DIR = path.join(__dirname, 'torrents');
@@ -169,28 +171,38 @@ app.get('/stream', async (req, res) => {
       return res.status(404).send('No se encontró un archivo de vídeo en este torrent');
     }
 
-    const range = req.headers.range;
-    const fileSize = file.length;
+    // Remuxeamos a fragmented MP4 y recodificamos el audio a AAC (el vídeo se copia tal
+    // cual, sin recodificar, para no gastar CPU). Esto arregla el audio mudo cuando el
+    // archivo original trae AC3/DTS, que los navegadores no saben decodificar.
+    // Como el tamaño de salida no se conoce de antemano, no soportamos Range aquí:
+    // no hay salto preciso en la barra de progreso, pero sí hay audio.
+    res.setHeader('Content-Type', 'video/mp4');
 
-    res.setHeader('Content-Type', mimeForFile(file.name));
-    res.setHeader('Accept-Ranges', 'bytes');
+    const ffmpeg = spawn(ffmpegPath, [
+      '-i', 'pipe:0',
+      '-c:v', 'copy',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+      '-f', 'mp4',
+      'pipe:1',
+    ]);
 
-    if (!range) {
-      res.setHeader('Content-Length', fileSize);
-      file.createReadStream().pipe(res);
-      return;
-    }
+    ffmpeg.stderr.on('data', () => {}); // silenciar logs de ffmpeg, no son errores necesariamente
 
-    const match = range.match(/bytes=(\d*)-(\d*)/);
-    let start = match[1] ? parseInt(match[1], 10) : 0;
-    let end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
-    if (end >= fileSize) end = fileSize - 1;
+    const source = file.createReadStream();
+    source.pipe(ffmpeg.stdin);
+    ffmpeg.stdout.pipe(res);
 
-    res.status(206);
-    res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
-    res.setHeader('Content-Length', end - start + 1);
-
-    file.createReadStream({ start, end }).pipe(res);
+    const cleanup = () => {
+      source.destroy();
+      ffmpeg.kill('SIGKILL');
+    };
+    req.on('close', cleanup);
+    ffmpeg.on('error', (err) => {
+      console.error('ffmpeg error:', err.message);
+      cleanup();
+    });
   } catch (err) {
     console.error(err);
     res.status(500).send('Error: ' + err.message);
