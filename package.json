@@ -12,6 +12,6 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "webtorrent": "^2.5.1"
+    "webtorrent": "^3.0.21"
   }
 }
